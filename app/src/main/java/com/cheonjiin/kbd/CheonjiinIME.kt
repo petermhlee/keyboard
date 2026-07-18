@@ -6,6 +6,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.widget.Button
@@ -205,92 +206,145 @@ class Composer {
 class CheonjiinIME : InputMethodService() {
 
     private val composer = Composer()
-    private var mode = "ko"   // "ko" | "en" | "sym"
+    private var mode = "ko"
     private var symReturn = "ko"
     private var capsOn = false
+    private val wordBuf = StringBuilder()
+    private var suggestionBar: LinearLayout? = null
 
     private val lockHandler = Handler(Looper.getMainLooper())
     private val lockRunnable = Runnable { composer.lockCons() }
+    private val repeatHandler = Handler(Looper.getMainLooper())
+    private var repeatRunnable: Runnable? = null
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+    private fun ic() = currentInputConnection
+
+    override fun onCreate() {
+        super.onCreate()
+        Thread { Corrector.ensureLoaded() }.start()
+    }
 
     override fun onCreateInputView(): View = buildKeyboardView()
 
     override fun onStartInput(info: EditorInfo?, restarting: Boolean) {
         super.onStartInput(info, restarting)
-        composer.reset()
+        composer.reset(); wordBuf.setLength(0)
     }
 
     override fun onFinishInput() {
         super.onFinishInput()
-        currentInputConnection?.finishComposingText()
-        composer.reset()
+        ic()?.finishComposingText()
+        composer.reset(); wordBuf.setLength(0)
     }
 
-    /* ---------- 입력 처리 ---------- */
-    private fun updateComposing(commit: String?) {
-        val ic = currentInputConnection ?: return
-        if (commit != null) ic.commitText(commit, 1)
-        ic.setComposingText(composer.render(), 1)
-    }
-
-    private fun onCons(key: String) {
-        updateComposing(composer.inputConsonant(key))
+    private fun armLock() {
         lockHandler.removeCallbacks(lockRunnable)
         lockHandler.postDelayed(lockRunnable, 650)
     }
+    private fun setComposing() { ic()?.setComposingText(composer.render(), 1) }
 
+    private fun onCons(key: String) {
+        val commit = composer.inputConsonant(key)
+        if (commit != null) { ic()?.commitText(commit, 1); wordBuf.append(commit) }
+        setComposing(); armLock(); updateSuggestions()
+    }
     private fun onVowel(sym: String) {
         lockHandler.removeCallbacks(lockRunnable)
-        updateComposing(composer.inputVowel(sym))
+        val commit = composer.inputVowel(sym)
+        if (commit != null) { ic()?.commitText(commit, 1); wordBuf.append(commit) }
+        setComposing(); updateSuggestions()
     }
-
-    private fun finalizeComposing() {
-        val ic = currentInputConnection ?: return
-        if (!composer.isEmpty()) ic.commitText(composer.render(), 1) else ic.finishComposingText()
+    private fun flushComposing() {
+        val c = ic() ?: return
+        if (!composer.isEmpty()) { val r = composer.render(); c.commitText(r, 1); wordBuf.append(r) }
+        else c.finishComposingText()
         composer.reset()
         lockHandler.removeCallbacks(lockRunnable)
     }
-
     private fun onBackspace() {
-        val ic = currentInputConnection ?: return
+        val c = ic() ?: return
         lockHandler.removeCallbacks(lockRunnable)
-        if (composer.backspace()) ic.setComposingText(composer.render(), 1)
-        else ic.deleteSurroundingText(1, 0)
+        if (composer.backspace()) {
+            c.setComposingText(composer.render(), 1)
+        } else {
+            c.deleteSurroundingText(1, 0)
+            if (wordBuf.isNotEmpty()) wordBuf.deleteCharAt(wordBuf.length - 1)
+        }
+        updateSuggestions()
     }
-
-    private fun onSpace() { finalizeComposing(); currentInputConnection?.commitText(" ", 1) }
+    private fun onSpace() {
+        flushComposing(); maybeAutoCorrect(); ic()?.commitText(" ", 1)
+        wordBuf.setLength(0); updateSuggestions()
+    }
     private fun onEnter() {
-        finalizeComposing()
-        val ic = currentInputConnection ?: return
-        val action = currentInputEditorInfo?.imeOptions?.and(EditorInfo.IME_MASK_ACTION) ?: EditorInfo.IME_ACTION_NONE
-        if (action != EditorInfo.IME_ACTION_NONE && action != EditorInfo.IME_ACTION_UNSPECIFIED)
-            ic.performEditorAction(action)
-        else ic.commitText("\n", 1)
+        flushComposing(); maybeAutoCorrect()
+        val c = ic() ?: return
+        val action = (currentInputEditorInfo?.imeOptions ?: 0) and EditorInfo.IME_MASK_ACTION
+        if (action != EditorInfo.IME_ACTION_NONE && action != EditorInfo.IME_ACTION_UNSPECIFIED) c.performEditorAction(action)
+        else c.commitText("\n", 1)
+        wordBuf.setLength(0); updateSuggestions()
     }
-    private fun onPunct(p: String) { finalizeComposing(); currentInputConnection?.commitText(p, 1) }
-
+    private fun onPunct(p: String) {
+        flushComposing(); maybeAutoCorrect(); ic()?.commitText(p, 1)
+        wordBuf.setLength(0); updateSuggestions()
+    }
     private fun onEnglish(ch: String) {
-        finalizeComposing()
-        currentInputConnection?.commitText(if (capsOn) ch.uppercase() else ch, 1)
+        flushComposing()
+        val s = if (capsOn) ch.uppercase() else ch
+        ic()?.commitText(s, 1); wordBuf.append(s)
         if (capsOn) { capsOn = false; setInputView(buildKeyboardView()) }
+        updateSuggestions()
+    }
+    private fun maybeAutoCorrect() {
+        val word = wordBuf.toString()
+        if (word.isEmpty()) return
+        val cand = Corrector.autoCorrect(word, mode) ?: return
+        val c = ic() ?: return
+        c.deleteSurroundingText(word.length, 0)
+        c.commitText(cand, 1)
+        wordBuf.setLength(0); wordBuf.append(cand)
     }
 
     private fun toggleLang() {
-        finalizeComposing()
-        mode = if (mode == "en") "ko" else "en"
-        capsOn = false
+        flushComposing(); wordBuf.setLength(0)
+        mode = if (mode == "en") "ko" else "en"; capsOn = false
         setInputView(buildKeyboardView())
     }
-
     private fun toggleSym() {
-        finalizeComposing()
+        flushComposing(); wordBuf.setLength(0)
         if (mode != "sym") { symReturn = mode; mode = "sym" } else { mode = symReturn }
         capsOn = false
         setInputView(buildKeyboardView())
     }
 
-    /* ---------- 키보드 뷰 ---------- */
+    private fun updateSuggestions() {
+        val bar = suggestionBar ?: return
+        bar.removeAllViews()
+        val word = wordBuf.toString() + (if (mode == "ko") composer.render() else "")
+        if (word.isEmpty() || mode == "sym") return
+        val cands = Corrector.suggest(word, mode)
+        for (cw in cands) {
+            val b = Button(this)
+            b.text = cw; b.isAllCaps = false
+            b.setTextColor(COL_TXT); b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            b.setBackgroundColor(COL_KEY)
+            val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.MATCH_PARENT)
+            lp.setMargins(dp(3), dp(4), dp(3), dp(4)); b.layoutParams = lp
+            b.setOnClickListener { applyCandidate(cw) }
+            bar.addView(b)
+        }
+    }
+    private fun applyCandidate(cw: String) {
+        flushComposing()
+        val word = wordBuf.toString()
+        val c = ic() ?: return
+        if (word.isNotEmpty()) c.deleteSurroundingText(word.length, 0)
+        c.commitText(cw, 1)
+        wordBuf.setLength(0); wordBuf.append(cw)
+        updateSuggestions()
+    }
+
     private val COL_BG = Color.parseColor("#0A0F1C")
     private val COL_KEY = Color.parseColor("#1B2440")
     private val COL_FN = Color.parseColor("#161F38")
@@ -299,31 +353,50 @@ class CheonjiinIME : InputMethodService() {
 
     private fun key(label: String, weight: Float, bg: Int, txtColor: Int, onClick: () -> Unit): Button {
         val b = Button(this)
-        b.text = label
-        b.isAllCaps = false
-        b.setTextColor(txtColor)
-        b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
-        b.setBackgroundColor(bg)
-        b.setPadding(0, 0, 0, 0)
+        b.text = label; b.isAllCaps = false
+        b.setTextColor(txtColor); b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
+        b.setBackgroundColor(bg); b.setPadding(0, 0, 0, 0)
         val lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, weight)
-        lp.setMargins(dp(2), dp(2), dp(2), dp(2))
-        b.layoutParams = lp
+        lp.setMargins(dp(2), dp(2), dp(2), dp(2)); b.layoutParams = lp
         b.setOnClickListener { onClick() }
         return b
     }
-
+    private fun backspaceKey(weight: Float): Button {
+        val b = key("⌫", weight, COL_FN, COL_TXT) { }
+        b.setOnTouchListener { v, ev ->
+            when (ev.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    onBackspace()
+                    val r = object : Runnable { override fun run() { onBackspace(); repeatHandler.postDelayed(this, 55) } }
+                    repeatRunnable = r
+                    repeatHandler.postDelayed(r, 400)
+                    true
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    repeatRunnable?.let { repeatHandler.removeCallbacks(it) }; repeatRunnable = null
+                    v.performClick(); true
+                }
+                else -> false
+            }
+        }
+        return b
+    }
     private fun row(): LinearLayout {
-        val r = LinearLayout(this)
-        r.orientation = LinearLayout.HORIZONTAL
+        val r = LinearLayout(this); r.orientation = LinearLayout.HORIZONTAL
         r.layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(52))
         return r
     }
-
     private fun buildKeyboardView(): View {
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
         root.setBackgroundColor(COL_BG)
         root.setPadding(dp(4), dp(6), dp(4), dp(8))
+        val sb = LinearLayout(this)
+        sb.orientation = LinearLayout.HORIZONTAL
+        sb.setBackgroundColor(COL_BG)
+        sb.layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(44))
+        suggestionBar = sb
+        root.addView(sb)
         when (mode) {
             "ko" -> buildKo(root)
             "en" -> buildEn(root)
@@ -333,24 +406,19 @@ class CheonjiinIME : InputMethodService() {
     }
 
     private fun buildKo(root: LinearLayout) {
-        val vowels = listOf("ㅣ", "ㆍ", "ㅡ")
         val r1 = row()
-        for (v in vowels) r1.addView(key(v, 1f, COL_KEY, if (v == "ㆍ") COL_ACCENT else COL_TXT) { onVowel(v) })
+        for (v in listOf("ㅣ", "ㆍ", "ㅡ")) r1.addView(key(v, 1f, COL_KEY, if (v == "ㆍ") COL_ACCENT else COL_TXT) { onVowel(v) })
         root.addView(r1)
-
-        val consRows = listOf(listOf("ㄱㅋ", "ㄴㄹ", "ㄷㅌ"), listOf("ㅂㅍ", "ㅅㅎ", "ㅈㅊ"))
-        for (cr in consRows) {
+        for (cr in listOf(listOf("ㄱㅋ","ㄴㄹ","ㄷㅌ"), listOf("ㅂㅍ","ㅅㅎ","ㅈㅊ"))) {
             val r = row()
             for (c in cr) r.addView(key(c, 1f, COL_KEY, COL_TXT) { onCons(c) })
             root.addView(r)
         }
-
         val r4 = row()
         r4.addView(key(". ,", 1f, COL_FN, COL_TXT) { onPunct(".") })
         r4.addView(key("ㅇㅁ", 1f, COL_KEY, COL_TXT) { onCons("ㅇㅁ") })
-        r4.addView(key("⌫", 1f, COL_FN, COL_TXT) { onBackspace() })
+        r4.addView(backspaceKey(1f))
         root.addView(r4)
-
         val r5 = row()
         r5.addView(key("!#1", 1f, COL_FN, COL_TXT) { toggleSym() })
         r5.addView(key("한/영", 1f, COL_FN, COL_ACCENT) { toggleLang() })
@@ -358,25 +426,19 @@ class CheonjiinIME : InputMethodService() {
         r5.addView(key("↵", 1f, COL_FN, COL_TXT) { onEnter() })
         root.addView(r5)
     }
-
+    private fun enLetter(ch: String): Button =
+        key(if (capsOn) ch.uppercase() else ch, 1f, COL_KEY, COL_TXT) { onEnglish(ch) }
     private fun buildEn(root: LinearLayout) {
         for (line in listOf("qwertyuiop", "asdfghjkl")) {
             val r = row()
-            for (ch in line) {
-                val s = ch.toString()
-                r.addView(key(if (capsOn) s.uppercase() else s, 1f, COL_KEY, COL_TXT) { onEnglish(s) })
-            }
+            for (ch in line) r.addView(enLetter(ch.toString()))
             root.addView(r)
         }
         val r3 = row()
         r3.addView(key("⇧", 1.5f, COL_FN, if (capsOn) COL_ACCENT else COL_TXT) { capsOn = !capsOn; setInputView(buildKeyboardView()) })
-        for (ch in "zxcvbnm") {
-            val s = ch.toString()
-            r3.addView(key(if (capsOn) s.uppercase() else s, 1f, COL_KEY, COL_TXT) { onEnglish(s) })
-        }
-        r3.addView(key("⌫", 1.5f, COL_FN, COL_TXT) { onBackspace() })
+        for (ch in "zxcvbnm") r3.addView(enLetter(ch.toString()))
+        r3.addView(backspaceKey(1.5f))
         root.addView(r3)
-
         val r4 = row()
         r4.addView(key("!#1", 1.2f, COL_FN, COL_TXT) { toggleSym() })
         r4.addView(key("한/영", 1.4f, COL_FN, COL_ACCENT) { toggleLang() })
@@ -385,14 +447,12 @@ class CheonjiinIME : InputMethodService() {
         r4.addView(key("↵", 1.4f, COL_FN, COL_TXT) { onEnter() })
         root.addView(r4)
     }
-
     private fun buildSym(root: LinearLayout) {
-        val rows = listOf(
+        for (line in listOf(
             listOf("1","2","3","4","5","6","7","8","9","0"),
             listOf("@","#","\$","%","&","-","+","(",")","/"),
             listOf("!","?",".",",",":",";","'","\"","~")
-        )
-        for (line in rows) {
+        )) {
             val r = row()
             for (s in line) r.addView(key(s, 1f, COL_KEY, COL_TXT) { onPunct(s) })
             root.addView(r)
@@ -400,7 +460,7 @@ class CheonjiinIME : InputMethodService() {
         val r4 = row()
         r4.addView(key("가/ABC", 1.6f, COL_FN, COL_ACCENT) { toggleSym() })
         r4.addView(key("space", 3.8f, COL_FN, COL_TXT) { onSpace() })
-        r4.addView(key("⌫", 1.4f, COL_FN, COL_TXT) { onBackspace() })
+        r4.addView(backspaceKey(1.4f))
         r4.addView(key("↵", 1.4f, COL_FN, COL_TXT) { onEnter() })
         root.addView(r4)
     }
