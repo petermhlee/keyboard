@@ -7,7 +7,15 @@ import android.os.Looper
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.MotionEvent
+import android.view.KeyEvent
 import android.view.View
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Bundle
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import androidx.core.content.ContextCompat
 import android.view.inputmethod.EditorInfo
 import android.widget.Button
 import android.widget.LinearLayout
@@ -234,9 +242,77 @@ class CheonjiinIME : InputMethodService() {
 
     override fun onFinishInput() {
         super.onFinishInput()
+        stopVoice()
         ic()?.finishComposingText()
         composer.reset(); wordBuf.setLength(0)
     }
+
+    // ---------- 음성 입력 ----------
+    private var recognizer: SpeechRecognizer? = null
+    private var listening = false
+
+    private fun hasMicPermission() =
+        ContextCompat.checkSelfPermission(this, android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+    private fun onMic() {
+        if (!hasMicPermission()) {
+            val i = Intent(this, VoicePermissionActivity::class.java)
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            try { startActivity(i) } catch (e: Exception) {}
+            return
+        }
+        if (listening) { stopVoice(); return }
+        startVoice()
+    }
+    private fun startVoice() {
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) return
+        flushComposing(); wordBuf.setLength(0)
+        val r = SpeechRecognizer.createSpeechRecognizer(this)
+        r.setRecognitionListener(object : RecognitionListener {
+            override fun onResults(b: Bundle) {
+                val list = b.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                val text = list?.firstOrNull()
+                if (!text.isNullOrEmpty()) commitVoice(text)
+                stopVoice()
+            }
+            override fun onError(error: Int) { stopVoice() }
+            override fun onPartialResults(b: Bundle?) {}
+            override fun onReadyForSpeech(p: Bundle?) {}
+            override fun onBeginningOfSpeech() {}
+            override fun onEndOfSpeech() {}
+            override fun onRmsChanged(v: Float) {}
+            override fun onBufferReceived(b: ByteArray?) {}
+            override fun onEvent(i: Int, b: Bundle?) {}
+        })
+        recognizer = r
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, if (mode == "en") "en-US" else "ko-KR")
+        intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
+        listening = true
+        setInputView(buildKeyboardView())
+        try { r.startListening(intent) } catch (e: Exception) { stopVoice() }
+    }
+    private fun stopVoice() {
+        val wasListening = listening
+        listening = false
+        recognizer?.let {
+            try { it.stopListening() } catch (e: Exception) {}
+            try { it.destroy() } catch (e: Exception) {}
+        }
+        recognizer = null
+        if (wasListening && currentInputConnection != null) setInputView(buildKeyboardView())
+    }
+    private fun commitVoice(t: String) {
+        val c = ic() ?: return
+        val trimmed = t.trim()
+        if (trimmed.isEmpty()) return
+        c.commitText("$trimmed ", 1)
+        wordBuf.setLength(0)
+        updateSuggestions()
+    }
+    private fun micKey(weight: Float): Button =
+        key("\uD83C\uDFA4", weight, COL_FN, if (listening) COL_REC else COL_ACCENT) { onMic() }
 
     private fun armLock() {
         lockHandler.removeCallbacks(lockRunnable)
@@ -279,11 +355,20 @@ class CheonjiinIME : InputMethodService() {
     }
     private fun onEnter() {
         flushComposing(); maybeAutoCorrect()
+        wordBuf.setLength(0)
         val c = ic() ?: return
-        val action = (currentInputEditorInfo?.imeOptions ?: 0) and EditorInfo.IME_MASK_ACTION
-        if (action != EditorInfo.IME_ACTION_NONE && action != EditorInfo.IME_ACTION_UNSPECIFIED) c.performEditorAction(action)
-        else c.commitText("\n", 1)
-        wordBuf.setLength(0); updateSuggestions()
+        val opts = currentInputEditorInfo?.imeOptions ?: 0
+        val action = opts and EditorInfo.IME_MASK_ACTION
+        val noEnterAction = (opts and EditorInfo.IME_FLAG_NO_ENTER_ACTION) != 0
+        if (!noEnterAction && action != EditorInfo.IME_ACTION_NONE && action != EditorInfo.IME_ACTION_UNSPECIFIED) {
+            // 검색/전송/완료 등 명시적 액션이 있는 입력창
+            c.performEditorAction(action)
+        } else {
+            // 그 외(카톡/문자/일반 편집기): 실제 Enter 키 이벤트 → 앱이 줄바꿈/전송을 알아서 처리
+            c.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_ENTER))
+            c.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_ENTER))
+        }
+        updateSuggestions()
     }
     private fun onPunct(p: String) {
         flushComposing(); maybeAutoCorrect(); ic()?.commitText(p, 1)
@@ -350,11 +435,12 @@ class CheonjiinIME : InputMethodService() {
     private val COL_FN = Color.parseColor("#161F38")
     private val COL_TXT = Color.parseColor("#E8ECF6")
     private val COL_ACCENT = Color.parseColor("#5FD6B4")
+    private val COL_REC = Color.parseColor("#FF6B6B")
 
     private fun key(label: String, weight: Float, bg: Int, txtColor: Int, onClick: () -> Unit): Button {
         val b = Button(this)
         b.text = label; b.isAllCaps = false
-        b.setTextColor(txtColor); b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
+        b.setTextColor(txtColor); b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 19f)
         b.setBackgroundColor(bg); b.setPadding(0, 0, 0, 0)
         val lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, weight)
         lp.setMargins(dp(2), dp(2), dp(2), dp(2)); b.layoutParams = lp
@@ -383,7 +469,7 @@ class CheonjiinIME : InputMethodService() {
     }
     private fun row(): LinearLayout {
         val r = LinearLayout(this); r.orientation = LinearLayout.HORIZONTAL
-        r.layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(52))
+        r.layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(60))
         return r
     }
     private fun buildKeyboardView(): View {
@@ -394,7 +480,7 @@ class CheonjiinIME : InputMethodService() {
         val sb = LinearLayout(this)
         sb.orientation = LinearLayout.HORIZONTAL
         sb.setBackgroundColor(COL_BG)
-        sb.layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(44))
+        sb.layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48))
         suggestionBar = sb
         root.addView(sb)
         when (mode) {
@@ -421,8 +507,9 @@ class CheonjiinIME : InputMethodService() {
         root.addView(r4)
         val r5 = row()
         r5.addView(key("!#1", 1f, COL_FN, COL_TXT) { toggleSym() })
+        r5.addView(micKey(1f))
         r5.addView(key("한/영", 1f, COL_FN, COL_ACCENT) { toggleLang() })
-        r5.addView(key("스페이스", 2.6f, COL_FN, COL_TXT) { onSpace() })
+        r5.addView(key("스페이스", 2.2f, COL_FN, COL_TXT) { onSpace() })
         r5.addView(key("↵", 1f, COL_FN, COL_TXT) { onEnter() })
         root.addView(r5)
     }
@@ -441,10 +528,11 @@ class CheonjiinIME : InputMethodService() {
         root.addView(r3)
         val r4 = row()
         r4.addView(key("!#1", 1.2f, COL_FN, COL_TXT) { toggleSym() })
-        r4.addView(key("한/영", 1.4f, COL_FN, COL_ACCENT) { toggleLang() })
-        r4.addView(key("space", 3.4f, COL_FN, COL_TXT) { onSpace() })
+        r4.addView(micKey(1.2f))
+        r4.addView(key("한/영", 1.3f, COL_FN, COL_ACCENT) { toggleLang() })
+        r4.addView(key("space", 3.0f, COL_FN, COL_TXT) { onSpace() })
         r4.addView(key(".", 1f, COL_FN, COL_TXT) { onPunct(".") })
-        r4.addView(key("↵", 1.4f, COL_FN, COL_TXT) { onEnter() })
+        r4.addView(key("↵", 1.3f, COL_FN, COL_TXT) { onEnter() })
         root.addView(r4)
     }
     private fun buildSym(root: LinearLayout) {
