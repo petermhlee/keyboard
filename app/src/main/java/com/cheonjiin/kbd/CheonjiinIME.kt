@@ -134,9 +134,14 @@ class Composer {
             else { commit = render(); clearAll(); cho = cyc[0]; mtKey = key; mtIdx = 0; mtSlot = "cho"; mtBase = "" }
             vstate = ""; vtaps.clear()
         } else if (jong == null) {
-            val cand = jongCands("", key)
-            if (cand.isNotEmpty()) { jong = cand[0]; mtKey = key; mtIdx = 0; mtSlot = "jong"; mtBase = "" }
-            else { commit = render(); clearAll(); cho = cyc[0]; mtKey = key; mtIdx = 0; mtSlot = "cho"; mtBase = "" }
+            if (cho == null) {
+                // 초성 없는 모음(예: ㅏ) 뒤 자음 → 받침으로 붙이지 말고 새 음절 시작
+                commit = render(); clearAll(); cho = cyc[0]; mtKey = key; mtIdx = 0; mtSlot = "cho"; mtBase = ""
+            } else {
+                val cand = jongCands("", key)
+                if (cand.isNotEmpty()) { jong = cand[0]; mtKey = key; mtIdx = 0; mtSlot = "jong"; mtBase = "" }
+                else { commit = render(); clearAll(); cho = cyc[0]; mtKey = key; mtIdx = 0; mtSlot = "cho"; mtBase = "" }
+            }
         } else {
             if (mtKey == key && mtSlot == "jong") {
                 val cand = jongCands(mtBase, key)
@@ -200,7 +205,8 @@ class Composer {
 class CheonjiinIME : InputMethodService() {
 
     private val composer = Composer()
-    private var mode = "ko"   // "ko" | "en"
+    private var mode = "ko"   // "ko" | "en" | "sym"
+    private var symReturn = "ko"
     private var capsOn = false
 
     private val lockHandler = Handler(Looper.getMainLooper())
@@ -272,7 +278,14 @@ class CheonjiinIME : InputMethodService() {
 
     private fun toggleLang() {
         finalizeComposing()
-        mode = if (mode == "ko") "en" else "ko"
+        mode = if (mode == "en") "ko" else "en"
+        capsOn = false
+        setInputView(buildKeyboardView())
+    }
+
+    private fun toggleSym() {
+        finalizeComposing()
+        if (mode != "sym") { symReturn = mode; mode = "sym" } else { mode = symReturn }
         capsOn = false
         setInputView(buildKeyboardView())
     }
@@ -311,7 +324,11 @@ class CheonjiinIME : InputMethodService() {
         root.orientation = LinearLayout.VERTICAL
         root.setBackgroundColor(COL_BG)
         root.setPadding(dp(4), dp(6), dp(4), dp(8))
-        if (mode == "ko") buildKo(root) else buildEn(root)
+        when (mode) {
+            "ko" -> buildKo(root)
+            "en" -> buildEn(root)
+            else -> buildSym(root)
+        }
         return root
     }
 
@@ -335,8 +352,9 @@ class CheonjiinIME : InputMethodService() {
         root.addView(r4)
 
         val r5 = row()
+        r5.addView(key("!#1", 1f, COL_FN, COL_TXT) { toggleSym() })
         r5.addView(key("한/영", 1f, COL_FN, COL_ACCENT) { toggleLang() })
-        r5.addView(key("스페이스", 3f, COL_FN, COL_TXT) { onSpace() })
+        r5.addView(key("스페이스", 2.6f, COL_FN, COL_TXT) { onSpace() })
         r5.addView(key("↵", 1f, COL_FN, COL_TXT) { onEnter() })
         root.addView(r5)
     }
@@ -360,10 +378,30 @@ class CheonjiinIME : InputMethodService() {
         root.addView(r3)
 
         val r4 = row()
-        r4.addView(key("한/영", 1.5f, COL_FN, COL_ACCENT) { toggleLang() })
-        r4.addView(key("space", 4f, COL_FN, COL_TXT) { onSpace() })
+        r4.addView(key("!#1", 1.2f, COL_FN, COL_TXT) { toggleSym() })
+        r4.addView(key("한/영", 1.4f, COL_FN, COL_ACCENT) { toggleLang() })
+        r4.addView(key("space", 3.4f, COL_FN, COL_TXT) { onSpace() })
         r4.addView(key(".", 1f, COL_FN, COL_TXT) { onPunct(".") })
-        r4.addView(key("↵", 1.5f, COL_FN, COL_TXT) { onEnter() })
+        r4.addView(key("↵", 1.4f, COL_FN, COL_TXT) { onEnter() })
+        root.addView(r4)
+    }
+
+    private fun buildSym(root: LinearLayout) {
+        val rows = listOf(
+            listOf("1","2","3","4","5","6","7","8","9","0"),
+            listOf("@","#","\$","%","&","-","+","(",")","/"),
+            listOf("!","?",".",",",":",";","'","\"","~")
+        )
+        for (line in rows) {
+            val r = row()
+            for (s in line) r.addView(key(s, 1f, COL_KEY, COL_TXT) { onPunct(s) })
+            root.addView(r)
+        }
+        val r4 = row()
+        r4.addView(key("가/ABC", 1.6f, COL_FN, COL_ACCENT) { toggleSym() })
+        r4.addView(key("space", 3.8f, COL_FN, COL_TXT) { onSpace() })
+        r4.addView(key("⌫", 1.4f, COL_FN, COL_TXT) { onBackspace() })
+        r4.addView(key("↵", 1.4f, COL_FN, COL_TXT) { onEnter() })
         root.addView(r4)
     }
 }
